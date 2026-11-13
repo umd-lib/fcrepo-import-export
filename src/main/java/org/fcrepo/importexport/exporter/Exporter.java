@@ -82,6 +82,7 @@ import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.commons.io.FileUtils.byteCountToDisplaySize;
@@ -90,6 +91,8 @@ import static org.apache.jena.rdf.model.ResourceFactory.createProperty;
 import static org.apache.jena.riot.RDFLanguages.contentTypeToLang;
 import static org.fcrepo.importexport.common.FcrepoConstants.CONTAINER;
 import static org.fcrepo.importexport.common.FcrepoConstants.CONTAINS;
+import static org.fcrepo.importexport.common.FcrepoConstants.HAS_MESSAGE_DIGEST;
+import static org.fcrepo.importexport.common.FcrepoConstants.HAS_SIZE;
 import static org.fcrepo.importexport.common.FcrepoConstants.HEADERS_EXTENSION;
 import static org.fcrepo.importexport.common.FcrepoConstants.INBOUND_REFERENCES;
 import static org.fcrepo.importexport.common.FcrepoConstants.MEMENTO;
@@ -123,6 +126,9 @@ public class Exporter implements TransferProcess {
     // Log progress every time this many resources have been exported
     private static final int REPORTING_INTERVAL = 10_000;
 
+    private static final String SHA1_URN_PREFIX = "urn:sha1:";
+    private static final Pattern SHA1_HEX = Pattern.compile("[0-9a-f]{40}");
+
     private final Config config;
     protected FcrepoClient.FcrepoClientBuilder clientBuilder;
     private final URI binaryURI;
@@ -142,6 +148,9 @@ public class Exporter implements TransferProcess {
     private final SimpleDateFormat dateFormat;
     private final AtomicLong successCount = new AtomicLong(); // set to zero at start
     private final AtomicLong successBytes = new AtomicLong();
+    private final AtomicLong linkedCount = new AtomicLong();
+    private final AtomicLong linkedBytes = new AtomicLong();
+    private final AtomicLong downloadedCount = new AtomicLong();
     private Instant startTime;
     protected URI repositoryRoot = null;
 
@@ -164,6 +173,17 @@ public class Exporter implements TransferProcess {
         this.dateFormat = new SimpleDateFormat("yyyy-MM-dd");
         this.repositoryRoot = config.getRepositoryRoot();
         this.taskManager = new TaskManager(config.getThreadCount());
+
+        final File binaryLinkDir = config.getBinaryLinkDir();
+        if (binaryLinkDir != null) {
+            if (config.getBagProfile() != null) {
+                throw new IllegalArgumentException("binaryLinkDir cannot be used with a bag profile: "
+                        + "a bag must contain the binaries' content");
+            }
+            if (!binaryLinkDir.isDirectory()) {
+                throw new IllegalArgumentException("binaryLinkDir is not a directory: " + binaryLinkDir);
+            }
+        }
 
         if (config.getBagProfile() != null) {
             configureBagItParameters();
@@ -364,6 +384,13 @@ public class Exporter implements TransferProcess {
             }
         }
         exportLogger.info("Finished export... {} bytes/{} resources exported", successBytes.get(), successCount.get());
+        if (config.getBinaryLinkDir() != null) {
+            final String summary = String.format("Linked %d binaries (%d bytes) to the binary store %s; "
+                    + "downloaded %d", linkedCount.get(), linkedBytes.get(), config.getBinaryLinkDir(),
+                    downloadedCount.get());
+            logger.info(summary);
+            exportLogger.info(summary);
+        }
     }
 
     private Map<String, String> bagTechMetadata() {
@@ -408,7 +435,7 @@ public class Exporter implements TransferProcess {
                 final boolean external = response.getHeaderValue("Content-Location") != null;
                 final boolean redirect = response.getStatusCode() >= 300 && response.getStatusCode() < 400;
                 final List<URI> describedby = response.getLinkHeaders("describedby");
-                exportBinary(uri, describedby, external, redirect);
+                exportBinary(uri, describedby, external, redirect, response);
             } else if (linkHeaders.contains(containerURI) || linkHeaders.contains(rdfSourceURI)) {
                 logger.debug("Found container at " + uri);
                 exportRdf(uri, null);
@@ -428,10 +455,19 @@ public class Exporter implements TransferProcess {
     }
 
     private void exportBinary(final URI uri, final List<URI> describedby, final boolean external,
-                              final boolean redirect) throws FcrepoOperationFailedException, IOException {
+                              final boolean redirect, final FcrepoResponse headResponse)
+            throws FcrepoOperationFailedException, IOException {
         if (!config.isIncludeBinaries()) {
             logger.debug("Skipping: {} -> binaries are not included in this export configuration", uri);
             return;
+        }
+
+        if (!external && config.getBinaryLinkDir() != null) {
+            if (linkBinary(uri, describedby, headResponse)) {
+                exportVersions(uri);
+                return;
+            }
+            downloadedCount.incrementAndGet();
         }
 
         GetBuilder getBuilder = client().get(uri);
@@ -464,6 +500,78 @@ public class Exporter implements TransferProcess {
 
         // Export versions for this binary
         exportVersions(uri);
+    }
+
+    /**
+     * Export a binary as a symbolic link to its content in the binary store, when the store holds it. The
+     * description is exported first, since it gives the content's SHA-1, which locates the file in the store, and
+     * its size, which the file must have.
+     *
+     * @param uri the binary
+     * @param describedby its descriptions
+     * @param headResponse the response to the HEAD request for the binary, whose headers are exported
+     * @return true if the binary was linked; false if it has to be downloaded
+     */
+    private boolean linkBinary(final URI uri, final List<URI> describedby, final FcrepoResponse headResponse)
+            throws FcrepoOperationFailedException, IOException {
+        if (describedby == null || describedby.isEmpty()) {
+            return false;
+        }
+        String sha1 = null;
+        Long size = null;
+        for (final URI description : describedby) {
+            exportRdf(description, uri);
+        }
+        for (final URI description : describedby) {
+            final File file = fileForURI(description, null, null, config.getBaseDirectory(),
+                    config.getRdfExtension());
+            if (!file.isFile()) {
+                continue;
+            }
+            final Model model = createDefaultModel();
+            try (InputStream in = Files.newInputStream(file.toPath())) {
+                model.read(in, null, config.getRdfLanguage());
+            }
+            final Resource binary = model.getResource(uri.toString());
+            final Statement digest = binary.getProperty(HAS_MESSAGE_DIGEST);
+            final Statement length = binary.getProperty(HAS_SIZE);
+            if (digest != null && digest.getObject().isURIResource()
+                    && digest.getObject().asResource().getURI().startsWith(SHA1_URN_PREFIX)) {
+                sha1 = digest.getObject().asResource().getURI().substring(SHA1_URN_PREFIX.length());
+            }
+            if (length != null && length.getObject().isLiteral()) {
+                size = length.getLong();
+            }
+            if (sha1 != null && size != null) {
+                break;
+            }
+        }
+        if (sha1 == null || size == null || !SHA1_HEX.matcher(sha1).matches()) {
+            logger.debug("No SHA-1 and size in the description of {}; downloading it", uri);
+            return false;
+        }
+
+        final Path content = config.getBinaryLinkDir().toPath().toAbsolutePath()
+                .resolve(sha1.substring(0, 2)).resolve(sha1.substring(2, 4)).resolve(sha1.substring(4, 6))
+                .resolve(sha1);
+        if (!Files.isRegularFile(content) || Files.size(content) != size) {
+            logger.debug("{} is not in the binary store with size {}; downloading it", uri, size);
+            return false;
+        }
+
+        final File file = fileForBinary(uri, null, null, config.getBaseDirectory());
+        if (!file.getParentFile().exists()) {
+            file.getParentFile().mkdirs();
+        }
+        Files.deleteIfExists(file.toPath());
+        Files.createSymbolicLink(file.toPath(), content);
+        writeHeadersFile(headResponse, getHeadersFile(file));
+        linkedCount.incrementAndGet();
+        linkedBytes.addAndGet(size);
+        logger.info("Linked binary {} to {}", uri, content);
+        exportLogger.info("export {} to {} (link to {})", uri, file.getAbsolutePath(), content);
+        incrementSuccessCount();
+        return true;
     }
 
     private void writeNonRedirectedHeaders(final URI uri, final File file)

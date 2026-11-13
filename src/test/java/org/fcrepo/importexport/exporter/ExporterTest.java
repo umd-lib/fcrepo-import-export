@@ -29,6 +29,7 @@ import static org.fcrepo.importexport.common.FcrepoConstants.NON_RDF_SOURCE;
 import static org.fcrepo.importexport.common.FcrepoConstants.RDF_SOURCE;
 import static org.fcrepo.importexport.common.FcrepoConstants.REPOSITORY_NAMESPACE;
 import static org.fcrepo.importexport.common.FcrepoConstants.REPOSITORY_ROOT;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
@@ -42,6 +43,7 @@ import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -471,6 +473,93 @@ public class ExporterTest {
         when(headResponse.getLinkHeaders(isA(String.class))).thenReturn(containerLinks);
         exporter.run();
         assertTrue(exporter.wroteFile(new File(basedir + "/rest/1.jsonld")));
+    }
+
+    private static final String BINARY_CONTENT = "binary";
+    private static final String BINARY_SHA1 = "7e57cfe843145135aee1f4d0d63ceb7842093712";
+
+    /** A binary store holding the given content at its SHA-1 path; returns the content file. */
+    private Path storeContent(final String storeDir, final String sha1, final String content) throws IOException {
+        final Path file = Paths.get(storeDir, sha1.substring(0, 2), sha1.substring(2, 4), sha1.substring(4, 6), sha1);
+        Files.createDirectories(file.getParent());
+        Files.write(file, content.getBytes(UTF_8));
+        return file;
+    }
+
+    private void mockDescription(final String sha1, final long size) throws FcrepoOperationFailedException {
+        mockResponse(resource4, descriptionLinks, new ArrayList<>(), "{\"@id\":\"" + resource3.toString()
+                + "\",\"http://www.loc.gov/premis/rdf/v1#hasMessageDigest\":{\"@id\":\"urn:sha1:" + sha1
+                + "\"},\"http://www.loc.gov/premis/rdf/v1#hasSize\":" + size + "}");
+    }
+
+    private Config linkConfig(final String basedir, final String storeDir) {
+        final Config args = new Config();
+        args.setMode("export");
+        args.setBaseDirectory(basedir);
+        args.setIncludeBinaries(true);
+        args.setPredicates(predicates);
+        args.setRdfLanguage("application/ld+json");
+        args.setResource(resource3);
+        args.setBinaryLinkDir(storeDir);
+        return args;
+    }
+
+    @Test
+    public void testExportBinaryLinkedToStore() throws Exception {
+        final String basedir = exportDirectory + "/link1";
+        final String storeDir = exportDirectory + "/store1";
+        final Path content = storeContent(storeDir, BINARY_SHA1, BINARY_CONTENT);
+        mockDescription(BINARY_SHA1, BINARY_CONTENT.length());
+
+        final ExporterWrapper exporter = new ExporterWrapper(linkConfig(basedir, storeDir), clientBuilder);
+        exporter.run();
+
+        final Path binary = Paths.get(basedir + "/rest/file1" + BINARY_EXTENSION);
+        assertTrue(Files.isSymbolicLink(binary));
+        assertEquals(content.toAbsolutePath(), Files.readSymbolicLink(binary));
+        assertFalse(exporter.wroteFile(binary.toFile()));
+        assertTrue(exporter.wroteFile(new File(basedir + "/rest/file1/fcr%3Ametadata.jsonld")));
+        assertTrue(exporter.wroteFile(new File(basedir + "/rest/alt_description.jsonld")));
+    }
+
+    @Test
+    public void testExportBinaryNotInStoreIsDownloaded() throws Exception {
+        final String basedir = exportDirectory + "/link2";
+        final String storeDir = exportDirectory + "/store2";
+        Files.createDirectories(Paths.get(storeDir));
+        mockDescription(BINARY_SHA1, BINARY_CONTENT.length());
+
+        final ExporterWrapper exporter = new ExporterWrapper(linkConfig(basedir, storeDir), clientBuilder);
+        exporter.run();
+
+        final Path binary = Paths.get(basedir + "/rest/file1" + BINARY_EXTENSION);
+        assertFalse(Files.isSymbolicLink(binary));
+        assertTrue(exporter.wroteFile(binary.toFile()));
+        assertEquals(BINARY_CONTENT, new String(Files.readAllBytes(binary), UTF_8));
+    }
+
+    @Test
+    public void testExportBinaryWithOtherSizeInStoreIsDownloaded() throws Exception {
+        final String basedir = exportDirectory + "/link3";
+        final String storeDir = exportDirectory + "/store3";
+        storeContent(storeDir, BINARY_SHA1, "different content");
+        mockDescription(BINARY_SHA1, BINARY_CONTENT.length());
+
+        final ExporterWrapper exporter = new ExporterWrapper(linkConfig(basedir, storeDir), clientBuilder);
+        exporter.run();
+
+        final Path binary = Paths.get(basedir + "/rest/file1" + BINARY_EXTENSION);
+        assertFalse(Files.isSymbolicLink(binary));
+        assertTrue(exporter.wroteFile(binary.toFile()));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testBinaryLinkDirRejectsBagProfile() throws Exception {
+        final String storeDir = exportDirectory + "/store4";
+        Files.createDirectories(Paths.get(storeDir));
+        final Config args = linkConfig(exportDirectory + "/link4", storeDir);
+        args.setBagProfile("default");
+        new ExporterWrapper(args, clientBuilder);
     }
 
     @Test

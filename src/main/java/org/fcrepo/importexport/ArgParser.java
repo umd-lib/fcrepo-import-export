@@ -139,6 +139,16 @@ public class ArgParser {
                 .desc("When present this flag indicates that external content should be exported.")
                 .required(false).build());
 
+        // Link binaries to a file-system binary store instead of downloading them
+        configOptions.addOption(Option.builder()
+                .longOpt("binaryLinkDir")
+                .hasArg(true).numberOfArgs(1).argName("dir")
+                .desc("When exporting binaries, the directory of a file-system binary store laid out by SHA-1 "
+                        + "(ab/cd/ef/abcdef...) that holds their content. A binary found there with the size its "
+                        + "description gives is exported as a symbolic link to that file instead of being "
+                        + "downloaded; others are downloaded.")
+                .required(false).build());
+
         // Retrieve inbound references
         configOptions.addOption(Option.builder("i")
                 .longOpt("inbound")
@@ -443,6 +453,7 @@ public class ArgParser {
         config.setIncludeAcls(cmd.hasOption("acls"));
         config.setIncludeBinaries(cmd.hasOption('b'));
         config.setRetrieveExternal(cmd.hasOption('x'));
+        config.setBinaryLinkDir(cmd.getOptionValue("binaryLinkDir"));
         config.setRetrieveInbound(cmd.hasOption('i'));
         config.setIncludeMembership(cmd.hasOption("membership"));
         config.setOverwriteTombstones(cmd.hasOption('t'));
@@ -625,6 +636,8 @@ public class ArgParser {
                 c.setIncludeAcls(parseBoolean("acls", entry.getValue(), lineNumber));
             } else if (entry.getKey().trim().equalsIgnoreCase("external")) {
                 c.setRetrieveExternal(parseBoolean("external", entry.getValue(), lineNumber));
+            } else if (entry.getKey().trim().equalsIgnoreCase("binaryLinkDir")) {
+                c.setBinaryLinkDir(entry.getValue());
             } else if (entry.getKey().trim().equalsIgnoreCase("inbound")) {
                 c.setRetrieveInbound(parseBoolean("inbound", entry.getValue(), lineNumber));
             } else if (entry.getKey().trim().equalsIgnoreCase("writeConfig")) {

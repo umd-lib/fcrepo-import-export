@@ -62,6 +62,7 @@ public class Config {
     private boolean includeAcls = false;
     private boolean includeBinaries = false;
     private boolean retrieveExternal = false;
+    private File binaryLinkDir = null;
     private boolean retrieveInbound = false;
     private boolean includeMembership = false;
     private boolean overwriteTombstones = false;
@@ -178,6 +179,26 @@ public class Config {
      */
     public boolean retrieveExternal() {
         return retrieveExternal;
+    }
+
+    /**
+     * Sets the directory of a file-system binary store, laid out by SHA-1 (ab/cd/ef/abcdef...), that holds the
+     * content of the binaries being exported. When set, a binary whose content is found there, with the size its
+     * description gives, is exported as a symbolic link to that file instead of being downloaded.
+     *
+     * @param binaryLinkDir the binary store directory, or null to download every binary
+     */
+    public void setBinaryLinkDir(final String binaryLinkDir) {
+        this.binaryLinkDir = binaryLinkDir == null ? null : new File(binaryLinkDir);
+    }
+
+    /**
+     * Returns the directory of the binary store that binaries are linked to, or null if binaries are downloaded.
+     *
+     * @return the binary store directory
+     */
+    public File getBinaryLinkDir() {
+        return binaryLinkDir;
     }
 
     /**
@@ -580,6 +601,9 @@ public class Config {
         map.put("acls", Boolean.toString(this.includeAcls));
         map.put("binaries", Boolean.toString(this.includeBinaries));
         map.put("external", Boolean.toString(this.retrieveExternal));
+        if (this.binaryLinkDir != null) {
+            map.put("binaryLinkDir", this.binaryLinkDir.getPath());
+        }
         map.put("inbound", Boolean.toString(this.retrieveInbound));
         map.put("membership", Boolean.toString(this.includeMembership));
         map.put("overwriteTombstones", Boolean.toString(this.overwriteTombstones()));
