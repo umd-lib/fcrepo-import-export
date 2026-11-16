@@ -58,8 +58,10 @@ import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
@@ -125,6 +127,9 @@ public class Exporter implements TransferProcess {
 
     // Log progress every time this many resources have been exported
     private static final int REPORTING_INTERVAL = 10_000;
+
+    // Files are written under this extension and renamed when complete
+    static final String PARTIAL_EXTENSION = ".part";
 
     private static final String SHA1_URN_PREFIX = "urn:sha1:";
     private static final Pattern SHA1_HEX = Pattern.compile("[0-9a-f]{40}");
@@ -470,6 +475,18 @@ public class Exporter implements TransferProcess {
             downloadedCount.incrementAndGet();
         }
 
+        if (!external && isDownloaded(uri, headResponse)) {
+            // An earlier run downloaded the content, but may have stopped before exporting its descriptions
+            logger.info("Already exported binary {}", uri);
+            if (describedby != null) {
+                for (final URI description : describedby) {
+                    exportRdf(description, uri);
+                }
+            }
+            exportVersions(uri);
+            return;
+        }
+
         GetBuilder getBuilder = client().get(uri);
         if (external && !config.retrieveExternal()) {
             getBuilder = getBuilder.disableRedirects();
@@ -500,6 +517,27 @@ public class Exporter implements TransferProcess {
 
         // Export versions for this binary
         exportVersions(uri);
+    }
+
+    /**
+     * @param uri a binary
+     * @param headResponse the response to the HEAD request for the binary
+     * @return true if the binary's content is already in the export, with the length the repository reports. A
+     *         file is only ever in the export with its whole content, since it is written under another name.
+     */
+    private boolean isDownloaded(final URI uri, final FcrepoResponse headResponse) {
+        if (bag != null) {
+            // A bag's manifests are built from the content as it is written
+            return false;
+        }
+        final Path file = fileForBinary(uri, null, null, config.getBaseDirectory()).toPath();
+        final String length = headResponse.getHeaderValue("Content-Length");
+        try {
+            return length != null && Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
+                    && Files.size(file) == Long.parseLong(length.trim());
+        } catch (final IOException | NumberFormatException e) {
+            return false;
+        }
     }
 
     /**
@@ -585,9 +623,18 @@ public class Exporter implements TransferProcess {
 
     private void exportRdf(final URI uri, final URI binaryURI) throws FcrepoOperationFailedException, IOException {
         final File file = fileForURI(uri, null, null, config.getBaseDirectory(), config.getRdfExtension());
-        if (file.exists()) {
-            logger.info("Already exported {}", uri);
-            return;
+        if (file.exists() && !config.retrieveInbound()) {
+            // An earlier run exported this resource, but may have stopped before reaching everything below it:
+            // continue from the exported RDF, so that a repeated export completes an interrupted one. With
+            // inbound references the exported RDF no longer names them, so the resource is retrieved again.
+            final Model exported = readExported(file);
+            if (exported != null) {
+                logger.info("Already exported {}; continuing with its members", uri);
+                exportMembers(exported, null);
+                exportVersions(uri);
+                return;
+            }
+            logger.warn("Exporting {} again: {} cannot be read", uri, file);
         }
 
         final GetBuilder getBuilder = client().get(uri).accept(config.getRdfLanguage());
@@ -654,6 +701,21 @@ public class Exporter implements TransferProcess {
 
         exportMembers(model, inboundMembers);
         exportVersions(uri);
+    }
+
+    /**
+     * @param file the exported RDF of a resource
+     * @return the RDF, or null if the file cannot be parsed
+     */
+    private Model readExported(final File file) {
+        final Model model = createDefaultModel();
+        try (InputStream in = Files.newInputStream(file.toPath())) {
+            model.read(in, null, config.getRdfLanguage());
+            return model;
+        } catch (final IOException | RuntimeException e) {
+            logger.debug("Cannot read {}: {}", file, e.toString());
+            return null;
+        }
     }
 
     private File getHeadersFile(final File file) {
@@ -846,8 +908,11 @@ public class Exporter implements TransferProcess {
 
         final InputStream wrappedStream = wrap(wrap(wrap(wrap(in, md5), sha1), sha256), sha512);
 
-        try (final OutputStream out = new BufferedOutputStream(new FileOutputStream(file))) {
-            final int bytes = IOUtils.copy(wrappedStream, out);
+        // Write to a temporary file and rename it, so that a file only ever exists with its whole content: an
+        // export interrupted while writing must not leave a partial file that looks exported
+        final Path partial = file.toPath().resolveSibling(file.getName() + PARTIAL_EXTENSION);
+        try (final OutputStream out = new BufferedOutputStream(new FileOutputStream(partial.toFile()))) {
+            final long bytes = IOUtils.copyLarge(wrappedStream, out);
             successBytes.addAndGet(bytes);
             if (md5FileMap != null) {
                 md5FileMap.put(file, Hex.encodeHexString(md5.digest()));
@@ -861,7 +926,11 @@ public class Exporter implements TransferProcess {
             if (sha512FileMap != null) {
                 sha512FileMap.put(file, Hex.encodeHexString(sha512.digest()));
             }
+        } catch (final IOException | RuntimeException e) {
+            Files.deleteIfExists(partial);
+            throw e;
         }
+        Files.move(partial, file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private void incrementSuccessCount() {

@@ -581,6 +581,51 @@ public class ExporterTest {
     }
 
     @Test
+    public void testRepeatedExportContinuesBelowExportedResource() throws Exception {
+        // An earlier, interrupted run exported the container but not its child
+        final String basedir = exportDirectory + "/11";
+        final File container = new File(basedir + "/rest/1.jsonld");
+        container.getParentFile().mkdirs();
+        Files.write(container.toPath(), ("{\"@id\":\"" + resource + "\",\"" + CONTAINS.getURI() + "\":[{\"@id\":\""
+                + resource2 + "\"}]}").getBytes(UTF_8));
+        final Config args = new Config();
+        args.setMode("export");
+        args.setBaseDirectory(basedir);
+        args.setIncludeBinaries(true);
+        args.setPredicates(predicates);
+        args.setRdfLanguage("application/ld+json");
+        args.setResource(resource);
+
+        final ExporterWrapper exporter = new ExporterWrapper(args, clientBuilder);
+        when(headResponse.getLinkHeaders(isA(String.class))).thenReturn(containerLinks);
+        exporter.run();
+        assertFalse(exporter.wroteFile(container));
+        assertTrue(exporter.wroteFile(new File(basedir + "/rest/1/2.jsonld")));
+    }
+
+    @Test
+    public void testRepeatedExportReplacesUnreadableRdf() throws Exception {
+        final String basedir = exportDirectory + "/12";
+        final File container = new File(basedir + "/rest/1.jsonld");
+        container.getParentFile().mkdirs();
+        Files.write(container.toPath(), "{\"@id\":\"http://localhost:8080/re".getBytes(UTF_8));
+        final Config args = new Config();
+        args.setMode("export");
+        args.setBaseDirectory(basedir);
+        args.setIncludeBinaries(true);
+        args.setPredicates(predicates);
+        args.setRdfLanguage("application/ld+json");
+        args.setResource(resource);
+
+        final ExporterWrapper exporter = new ExporterWrapper(args, clientBuilder);
+        when(headResponse.getLinkHeaders(isA(String.class))).thenReturn(containerLinks);
+        exporter.run();
+        assertTrue(exporter.wroteFile(container));
+        assertTrue(exporter.wroteFile(new File(basedir + "/rest/1/2.jsonld")));
+        assertFalse(new File(basedir + "/rest/1.jsonld.part").exists());
+    }
+
+    @Test
     public void testExportBagCustomTags() throws Exception, FcrepoOperationFailedException {
         final String basedir = exportDirectory + "/10";
         final Config bagArgs = new Config();
