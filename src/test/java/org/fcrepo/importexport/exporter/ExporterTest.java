@@ -37,6 +37,9 @@ import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -66,6 +69,7 @@ import org.fcrepo.importexport.test.util.ResponseMocker;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 /**
  * @author escowles
@@ -626,6 +630,81 @@ public class ExporterTest {
     }
 
     @Test
+    public void testResourceFailingWithAnErrorIsListedAsRemaining() throws Exception {
+        final String basedir = exportDirectory + "/13";
+        final Config args = new Config();
+        args.setMode("export");
+        args.setBaseDirectory(basedir);
+        args.setIncludeBinaries(true);
+        args.setPredicates(predicates);
+        args.setRdfLanguage("application/ld+json");
+        args.setResource(resource);
+        when(client.head(resource2)).thenThrow(new OutOfMemoryError("test"));
+
+        final Logger remaining = (Logger) LoggerFactory.getLogger("org.fcrepo.importexport.remaining");
+        final ListAppender<ILoggingEvent> listed = new ListAppender<>();
+        listed.start();
+        remaining.addAppender(listed);
+        try {
+            final ExporterWrapper exporter = new ExporterWrapper(args, clientBuilder);
+            when(headResponse.getLinkHeaders(isA(String.class))).thenReturn(containerLinks);
+            exporter.run();
+            assertTrue(exporter.wroteFile(new File(basedir + "/rest/1.jsonld")));
+            assertFalse(exporter.wroteFile(new File(basedir + "/rest/1/2.jsonld")));
+        } finally {
+            remaining.detachAppender(listed);
+        }
+        assertEquals(1, listed.list.size());
+        assertEquals(resource2.toString(), listed.list.get(0).getFormattedMessage());
+    }
+
+    @Test
+    public void testChildrenAreExportedBeforeSiblings() throws Exception {
+        final String basedir = exportDirectory + "/14";
+        final URI parent = new URI("http://localhost:8080/rest/p");
+        final URI first = new URI("http://localhost:8080/rest/p/a");
+        final URI firstChild = new URI("http://localhost:8080/rest/p/a/c");
+        final URI second = new URI("http://localhost:8080/rest/p/b");
+        final URI secondChild = new URI("http://localhost:8080/rest/p/b/c");
+        mockResponse(parent, containerLinks, new ArrayList<>(), containerBody(parent, first, second));
+        mockResponse(first, containerLinks, new ArrayList<>(), containerBody(first, firstChild));
+        mockResponse(second, containerLinks, new ArrayList<>(), containerBody(second, secondChild));
+        mockResponse(firstChild, containerLinks, new ArrayList<>(), containerBody(firstChild));
+        mockResponse(secondChild, containerLinks, new ArrayList<>(), containerBody(secondChild));
+        final Config args = new Config();
+        args.setMode("export");
+        args.setBaseDirectory(basedir);
+        args.setIncludeBinaries(true);
+        args.setPredicates(predicates);
+        args.setRdfLanguage("application/ld+json");
+        args.setResource(parent);
+        args.setThreadCount(1);
+
+        final ExporterWrapper exporter = new ExporterWrapper(args, clientBuilder);
+        when(headResponse.getLinkHeaders(isA(String.class))).thenReturn(containerLinks);
+        exporter.run();
+
+        final List<String> order = exporter.writtenRdf(basedir + "/rest/p");
+        assertEquals(5, order.size());
+        assertEquals(".jsonld", order.get(0));
+        final String sibling = order.get(1).substring(0, 1);            // whichever child ran first
+        assertEquals(sibling + ".jsonld", order.get(1));
+        assertEquals(sibling + "/c.jsonld", order.get(2));
+    }
+
+    private static String containerBody(final URI uri, final URI... children) {
+        final StringBuilder body = new StringBuilder("{\"@id\":\"" + uri + "\"");
+        if (children.length > 0) {
+            body.append(",\"").append(CONTAINS.getURI()).append("\":[");
+            for (int i = 0; i < children.length; i++) {
+                body.append(i > 0 ? "," : "").append("{\"@id\":\"").append(children[i]).append("\"}");
+            }
+            body.append("]");
+        }
+        return body.append("}").toString();
+    }
+
+    @Test
     public void testExportBagCustomTags() throws Exception, FcrepoOperationFailedException {
         final String basedir = exportDirectory + "/10";
         final Config bagArgs = new Config();
@@ -672,5 +751,19 @@ class ExporterWrapper extends Exporter {
 
     boolean wroteFile(final File file) {
         return writtenFiles.contains(file);
+    }
+
+    /**
+     * @param prefix the path the files are under
+     * @return the RDF files written under it, in the order written, each without the prefix
+     */
+    List<String> writtenRdf(final String prefix) {
+        final List<String> names = new ArrayList<>();
+        for (final File file : writtenFiles) {
+            if (file.getPath().startsWith(prefix) && file.getName().endsWith(".jsonld")) {
+                names.add(file.getPath().substring(prefix.length()).replaceFirst("^/", ""));
+            }
+        }
+        return names;
     }
 }

@@ -78,7 +78,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -971,7 +971,7 @@ public class Exporter implements TransferProcess {
 
             this.executorService = new ThreadPoolExecutor(threads, threads,
                     0L, TimeUnit.MILLISECONDS,
-                    new LinkedBlockingQueue<>()) {
+                    new NewestFirstQueue()) {
                 @Override
                 protected <T> RunnableFuture<T> newTaskFor(final Callable<T> callable) {
                     return new FutureTaskWithCallable<>(callable);
@@ -1014,6 +1014,13 @@ public class Exporter implements TransferProcess {
                             exportLogger.error(String.format("Error exporting content from uri: %1$s, Message: %2$s",
                                     uri, e), e);
                         }
+                    } catch (Error e) {
+                        // Left to the task's Future nothing would read it, and this resource and everything below
+                        // it would be missing from the export without a trace
+                        remainingLogger.error("{}", uri);
+                        logger.error("Error exporting {}: {}", uri, e.toString());
+                        exportLogger.error(String.format("Error exporting content from uri: %1$s, Message: %2$s",
+                                uri, e), e);
                     } finally {
                         count.decrementAndGet();
                         synchronized (lock) {
@@ -1081,6 +1088,20 @@ public class Exporter implements TransferProcess {
                     logger.warn("Failed to extract unprocessed resource URI", e);
                 }
             });
+        }
+    }
+
+    /**
+     * Gives a worker the task queued last, so that a resource's children are exported before its siblings. The
+     * queue then holds the branch being walked, rather than a whole level of the repository in memory.
+     */
+    private static class NewestFirstQueue extends LinkedBlockingDeque<Runnable> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public boolean offer(final Runnable task) {
+            return offerFirst(task);
         }
     }
 
